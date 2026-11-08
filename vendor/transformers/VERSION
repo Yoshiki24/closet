@@ -1,0 +1,3 @@
+transformers 4.3.2
+onnxruntime-web 1.31.0-dev.20260914-8d85527a0
+build: esbuild entry.js(import * as T from "@huggingface/transformers"; self.Transformers = T) --bundle --format=iife --minify --main-fields=browser,module,main
