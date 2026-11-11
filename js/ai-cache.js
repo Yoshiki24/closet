@@ -3,7 +3,6 @@
 (function (root) {
   const DB_NAME = 'closet-ai-models';
   const STORE = 'files';
-  const REQUIRED = ['onnx/vision_model_q4.onnx', 'onnx/model_quantized.onnx'];
 
   function openDb() {
     return new Promise((resolve, reject) => {
@@ -47,10 +46,19 @@
     return (await run('readonly', (s) => s.getAllKeys())) || [];
   }
 
-  async function status() {
+  // mode('light' / 'high')のモデルがそろっているか
+  async function status(mode = 'high') {
     if (typeof indexedDB === 'undefined' || typeof WebAssembly === 'undefined') return 'unsupported';
-    const list = await keys();
-    return REQUIRED.every((f) => list.some((k) => String(k).endsWith(f))) ? 'ready' : 'none';
+    const list = (await keys()).map(String);
+    return root.AiPolicy.requiredFiles(mode).every(([repo, file]) => list.some((k) => k.includes(repo) && k.endsWith(file))) ? 'ready' : 'none';
+  }
+
+  // 使わないモードの切り抜きモデルを消して、端末の容量を空ける
+  async function prune(mode) {
+    const keep = root.AiPolicy.SEG[mode][0];
+    const others = Object.values(root.AiPolicy.SEG).map(([repo]) => repo).filter((r) => r !== keep);
+    const drop = (await keys()).map(String).filter((k) => others.some((r) => k.includes(r)));
+    if (drop.length) await run('readwrite', (s) => { drop.forEach((k) => s.delete(k)); return null; });
   }
 
   async function sizeMB() {
@@ -69,5 +77,5 @@
     if (typeof caches !== 'undefined') await caches.delete('transformers-cache');
   }
 
-  root.AiCache = { cache, status, sizeMB, clear };
+  root.AiCache = { cache, status, sizeMB, clear, prune };
 })(typeof self !== 'undefined' ? self : window);

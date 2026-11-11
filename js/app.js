@@ -33,7 +33,7 @@
     date: localDate(), mood: 'relax', seed: 1, proposal: null, manual: null, manualOpen: false,
     category: 'all', logMode: 'worn', urls: new Map(), queue: [], moods: {}, artMode: null,
     lockOwner: null, // この端末を使う人を固定するとき 'him' / 'her'
-    aiStatus: 'none', aiAsked: false, aiProgress: null, procToken: 0, prefetch: null,
+    aiStatus: 'none', aiAsked: false, aiSetting: 'auto', aiBlocked: false, aiLightFailures: 0, aiLast: null, aiStop: null, aiProgress: null, procToken: 0, prefetch: null,
   };
 
   // ---- 共通部品 ----
@@ -446,19 +446,37 @@
 
   function aiSettingsHTML() {
     const st = state.aiStatus;
+    const mode = Ai.mode;
+    const mb = AiPolicy.downloadMB(mode);
     let body;
     if (state.aiProgress !== null) {
       body = `<p class="small" style="margin:0 0 8px" role="status">AIを準備しています ${Math.round(state.aiProgress * 100)}%</p>${progressBar(state.aiProgress)}`;
+    } else if (st === 'blocked') {
+      body = `<p class="small" style="margin:0 0 10px">この端末では、AIの処理が続けて止まったため、AIを止めています。写真は簡易の切り抜きで登録します。</p>
+        <button class="btn" data-act="ai-unblock">もう一度試す</button>`;
     } else if (st === 'ready') {
       body = `<p class="small" style="margin:0 0 10px">準備済み${state.aiSize ? `(${state.aiSize}MB)` : ''}。写真の向き・背景の切り抜き・種類などの判別を、この端末の中で行います。</p>
         <button class="btn danger" data-act="ai-remove">AIを削除</button>`;
     } else if (st === 'unsupported') {
       body = '<p class="small muted" style="margin:0">このブラウザでは使えません。簡易の切り抜きと手での入力で登録できます。</p>';
     } else {
-      body = `<p class="small muted" style="margin:0 0 10px">写真の向きと背景の切り抜きを自動で直し、種類・色・柄などを判別して入力します。写真は外部に送りません。初回だけ約110MBを取得します。</p>
+      body = `<p class="small muted" style="margin:0 0 10px">写真の向きと背景の切り抜きを自動で直し、種類・色・柄などを判別して入力します。写真は外部に送りません。初回だけ約${mb}MBを取得します。</p>
         <button class="btn" data-act="ai-prepare">AIを準備する</button>`;
     }
-    return `<section class="card"><h2>写真のAI</h2>${body}</section>`;
+    const auto = AiPolicy.effectiveMode('auto', aiEnv());
+    const modes = [['auto', `自動(${aiModeName(auto)})`], ['light', '軽量'], ['high', '高品質']];
+    const mem = navigator.deviceMemory ? `・メモリの目安 ${navigator.deviceMemory}GB以上` : '';
+    const last = state.aiLast ? `判別 ${state.aiLast.device.vision === 'webgpu' ? 'WebGPU' : 'WASM'}・切り抜き WASM・${(state.aiLast.ms / 1000).toFixed(1)}秒(${aiModeName(state.aiLast.mode)})` : 'まだありません';
+    const stop = state.aiStop ? (() => { const d = new Date(state.aiStop.at); return `${d.getMonth() + 1}/${d.getDate()} ${AiPolicy.stepLabel(state.aiStop.step)}の途中(${aiModeName(state.aiStop.mode)}${state.aiStop.reason === 'closed' ? '・アプリが閉じた' : ''})`; })() : 'なし';
+    return `<section class="card" id="ai-settings"><h2>写真のAI</h2>${body}
+      <div class="form-row" style="margin:16px 0 8px"><span class="label">切り抜きのモード</span>
+        <div class="chips" role="group" aria-label="切り抜きのモード">${modes.map(([id, label]) => `<button class="chip" data-act="ai-mode" data-id="${id}" aria-pressed="${state.aiSetting === id}">${label}</button>`).join('')}</div>
+        <p class="small muted" style="margin:4px 0 0">軽量: 約${AiPolicy.downloadMB('light')}MB。スマホ向けで速いが、服と背景の色が近い写真は苦手。高品質: 約${AiPolicy.downloadMB('high')}MB。きれいだが重い</p></div>
+      <dl class="ai-diag small">
+        <dt>この端末</dt><dd>${aiEnv().mobile ? 'スマホ・タブレット' : 'パソコン'}${mem}</dd>
+        <dt>前回の処理</dt><dd>${esc(last)}</dd>
+        <dt>止まった記録</dt><dd>${esc(stop)}</dd>
+      </dl></section>`;
   }
 
   const progressBar = (r) => `<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(r * 100)}"><span style="width:${Math.round(r * 100)}%"></span></div>`;
@@ -489,8 +507,17 @@
   async function processPhoto(file, onStep = () => {}) {
     const photo = await Photo.normalize(file);
     if (state.aiStatus === 'ready') {
+      const mode = Ai.mode;
+      let step = 0;
+      const mark = () => { try { localStorage.setItem(INFLIGHT, JSON.stringify({ step, mode, at: Date.now() })); } catch {} };
+      mark();
       try {
-        const r = await Ai.analyze(photo, onStep);
+        const t0 = performance.now();
+        const r = await Ai.analyze(photo, (s, label) => { step = s; mark(); onStep(s, label); });
+        localStorage.removeItem(INFLIGHT);
+        state.aiLast = { device: r.device, mode: r.mode, ms: Math.round(performance.now() - t0) };
+        try { localStorage.setItem(LAST_RUN, JSON.stringify(state.aiLast)); } catch {}
+        if (mode === 'light' && state.aiLightFailures) { state.aiLightFailures = 0; DB.setMeta('aiLightFailures', 0); }
         const edit = { ...Photo.NO_EDIT, rotate: r.rotate };
         const composed = await Photo.compose(photo, { edit, mask: r.mask });
         const values = AiMap.toFormValues(r.ranks);
@@ -501,13 +528,19 @@
         };
       } catch (err) {
         console.warn(err);
+        localStorage.removeItem(INFLIGHT);
+        // 重すぎた兆候のときだけ軽くする。ほかのエラーは今回の写真だけ簡易の切り抜きにする
+        const overload = AiPolicy.isOverload(err);
+        if (overload) await aiFailed({ step, mode, reason: String(err?.message || err).slice(0, 120) });
         const fb = await Photo.reanalyze(photo, 'normal');
-        return { photo, ...fb, ai: { version: 1, method: 'fallback' }, notice: { text: 'AIが使えないため、簡易の切り抜きで登録します' } };
+        const after = !overload ? '' : state.aiBlocked ? 'この端末ではAIを止めました' : mode === 'high' ? '次からは軽量モードで処理します' : '';
+        return { photo, ...fb, ai: { version: 1, method: 'fallback' }, notice: { text: `AIが${AiPolicy.stepLabel(step)}の途中で止まったため、簡易の切り抜きで登録します${after ? `(${after})` : ''}` } };
       }
     }
     onStep(2, '背景を切り抜いています');
     const fb = await Photo.reanalyze(photo, 'normal');
-    return { photo, ...fb, ai: { version: 1, method: 'fallback' }, notice: { text: 'AIを使わず、簡易の切り抜きで登録します(AIは設定から準備できます)' } };
+    const why = state.aiStatus === 'blocked' ? 'この端末ではAIを止めているため、簡易の切り抜きで登録します' : 'AIを使わず、簡易の切り抜きで登録します(AIは設定から準備できます)';
+    return { photo, ...fb, ai: { version: 1, method: 'fallback' }, notice: { text: why } };
   }
 
   function draftFromResult(result) {
@@ -536,11 +569,69 @@
 
   function askPrepare() {
     return new Promise((resolve) => {
-      confirmBox.innerHTML = `<p><strong>AIを準備します(約110MB・初回だけ)</strong></p>
+      confirmBox.innerHTML = `<p><strong>AIを準備します(約${AiPolicy.downloadMB(Ai.mode)}MB・初回だけ)</strong></p>
         <p class="small muted">写真の向きと背景の切り抜きを自動で直し、種類・色・柄などを判別して入力します。写真は外部に送りません。Wi-Fiでの準備をおすすめします。</p>
         <div class="btn-row"><button class="btn" type="button" data-act="ai-later">あとで</button><button class="btn primary" type="button" data-act="ai-prepare">準備する</button></div>`;
       confirmBox.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => { confirmBox.close(); resolve(b.dataset.act === 'ai-prepare' ? 'prepare' : 'later'); }));
       confirmBox.oncancel = () => resolve('later');
+      confirmBox.showModal();
+    });
+  }
+
+  // ---- 写真のAIの動かし方(重い端末で止まらないようにする) ----
+  const INFLIGHT = 'closet-ai-inflight'; // 処理中の段階。アプリごと落ちても残るよう localStorage に書く
+  const LAST_STOP = 'closet-ai-last-stop';
+  const LAST_RUN = 'closet-ai-last-run'; // 前回の処理の方式と秒数(端末ごとの原因を確かめるため)
+  const aiEnv = () => ({ mobile: AiPolicy.isMobile(navigator) });
+  const aiModeName = (m) => (m === 'light' ? '軽量' : '高品質');
+
+  async function refreshAiStatus() {
+    Ai.mode = AiPolicy.effectiveMode(state.aiSetting, aiEnv());
+    state.aiStatus = state.aiBlocked ? 'blocked' : await Ai.status();
+    if (state.aiStatus === 'ready') state.aiSize = await Ai.sizeMB().catch(() => 0);
+  }
+
+  function readLastStop() {
+    try { return JSON.parse(localStorage.getItem(LAST_STOP)); } catch { return null; }
+  }
+
+  function readLastRun() {
+    try {
+      const v = JSON.parse(localStorage.getItem(LAST_RUN));
+      return v && v.device && typeof v.ms === 'number' && ['light', 'high'].includes(v.mode) ? v : null;
+    } catch { return null; }
+  }
+
+  // 止まったとき: 高品質なら軽量へ、軽量で続けて止まったらAIを止める
+  async function aiFailed(stop) {
+    const next = AiPolicy.afterFailure({ mode: stop.mode, lightFailures: state.aiLightFailures });
+    state.aiSetting = next.setting;
+    state.aiLightFailures = next.lightFailures;
+    state.aiBlocked = next.blocked;
+    state.aiStop = { ...stop, at: stop.at || Date.now() };
+    try { localStorage.setItem(LAST_STOP, JSON.stringify(state.aiStop)); } catch {}
+    await DB.setMeta('aiSetting', state.aiSetting);
+    await DB.setMeta('aiLightFailures', state.aiLightFailures);
+    await DB.setMeta('aiBlocked', state.aiBlocked);
+    state.aiAsked = false;
+    await refreshAiStatus();
+  }
+
+  // 前回アプリが処理の途中で閉じていたら、その端末は重すぎたとみなして軽くする
+  async function checkPreviousCrash() {
+    const rec = AiPolicy.parseInflight(localStorage.getItem(INFLIGHT));
+    localStorage.removeItem(INFLIGHT);
+    if (!rec) return;
+    await aiFailed({ ...rec, reason: 'closed' });
+    const what = AiPolicy.stepLabel(rec.step);
+    const next = state.aiBlocked
+      ? 'この端末ではAIを止め、簡易の切り抜きで登録するようにしました。設定の「写真のAI」から、もう一度試せます。'
+      : `次からは、軽いAI(軽量モード・約${AiPolicy.downloadMB('light')}MB)で処理します。`;
+    await new Promise((resolve) => {
+      confirmBox.innerHTML = `<p><strong>前回、写真の${esc(what)}の途中でアプリが止まりました</strong></p><p class="small">${aiModeName(rec.mode)}モードのAIが、この端末には重すぎたようです。${next}</p>
+        <div class="btn-row"><button class="btn primary" type="button">閉じる</button></div>`;
+      confirmBox.querySelector('button').addEventListener('click', () => { confirmBox.close(); resolve(); });
+      confirmBox.oncancel = () => resolve();
       confirmBox.showModal();
     });
   }
@@ -813,7 +904,7 @@
     const owner = state.owner;
     try {
       showProgress(pre ? '次の写真を準備しています' : '写真を読み込んでいます');
-      const result = await (pre || processPhoto(file, (step, label) => { if (token === state.procToken) showProgress(`${step}/3 ${label}`); }));
+      const result = await (pre || processPhoto(file, (step, label) => { if (token === state.procToken) showProgress(step ? `${step}/3 ${label}` : label); }));
       if (token !== state.procToken || owner !== state.owner) return; // 閉じた、または人を切り替えた
       openItemForm(draftFromResult(result));
       startPrefetch();
@@ -828,7 +919,7 @@
   async function addPhotos(files) {
     const list = [...files].filter((f) => f.type.startsWith('image/') || !f.type);
     if (!list.length) return;
-    state.aiStatus = await Ai.status();
+    await refreshAiStatus();
     if (state.aiStatus === 'none' && !state.aiAsked) {
       state.aiAsked = true;
       if ((await askPrepare()) === 'prepare') {
@@ -844,7 +935,7 @@
     state.queue = list.slice(1);
     state.prefetch = null;
     await openPhoto(list[0]);
-    if (state.aiStatus === 'failed') state.aiStatus = await Ai.status();
+    if (state.aiStatus === 'failed') await refreshAiStatus();
   }
 
   function afterItemsChanged() {
@@ -1187,10 +1278,27 @@
         state.aiProgress = null;
         render();
         break;
+      case 'ai-mode':
+        state.aiSetting = ['auto', 'light', 'high'].includes(id) ? id : 'auto';
+        await DB.setMeta('aiSetting', state.aiSetting);
+        state.aiAsked = false;
+        await refreshAiStatus();
+        toast(`切り抜きを${aiModeName(Ai.mode)}モードにしました${state.aiStatus === 'none' ? '(次に写真を登録するときにAIを準備します)' : ''}`);
+        render();
+        break;
+      case 'ai-unblock':
+        state.aiBlocked = false;
+        state.aiLightFailures = 0;
+        await DB.setMeta('aiBlocked', false);
+        await DB.setMeta('aiLightFailures', 0);
+        state.aiAsked = false;
+        await refreshAiStatus();
+        render();
+        break;
       case 'ai-remove':
         if (!(await confirmDialog('AIのモデルをこの端末から削除します。次に使うときは、もう一度取得が必要です。'))) return;
         await Ai.remove();
-        state.aiStatus = await Ai.status();
+        await refreshAiStatus();
         render();
         break;
       case 'skip-photo':
@@ -1320,8 +1428,14 @@
     const saved = await DB.getMeta('profiles', null);
     if (saved) state.profiles = { him: { ...DEFAULT_PROFILES.him, ...saved.him }, her: { ...DEFAULT_PROFILES.her, ...saved.her } };
     await loadOwner();
-    state.aiStatus = await Ai.status().catch(() => 'unsupported');
-    if (state.aiStatus === 'ready') state.aiSize = await Ai.sizeMB().catch(() => 0);
+    state.aiSetting = await DB.getMeta('aiSetting', 'auto');
+    state.aiLightFailures = Number(await DB.getMeta('aiLightFailures', 0)) || 0;
+    state.aiBlocked = (await DB.getMeta('aiBlocked', false)) === true;
+    state.aiStop = readLastStop();
+    state.aiLast = readLastRun();
+    await refreshAiStatus().catch(() => { state.aiStatus = 'unsupported'; });
+    render();
+    await checkPreviousCrash();
     render();
     await loadWeather(false);
     refreshProposal();

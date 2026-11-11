@@ -1,12 +1,13 @@
 // AIの推論の本体。Web Worker の中でも、画面側でも同じコードで動く(self.Transformers と self.AI_LABELS が前提)
 (function (root) {
   const ORT_VERSION = '1.31.0-dev.20260914-8d85527a0';
-  const VISION = 'Marqo/marqo-fashionSigLIP';
-  const SEG = 'briaai/RMBG-1.4';
-  const EXPECTED_BYTES = 106e6;
+  const VISION = root.AiPolicy.VISION[0];
+  const SEG = { light: root.AiPolicy.SEG.light[0], high: root.AiPolicy.SEG.high[0] };
   const MAX_SIDE = 1024;
+  const LIGHT_SIZE = 320; // 軽量モデルの入力の大きさ
+  const IMAGENET = { mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] };
   const T = () => root.Transformers;
-  let models = null;
+  let models = null; // { mode, ... }
   let loading = null;
   let labels = null;
 
@@ -27,17 +28,25 @@
     env.backends.onnx.wasm.wasmPaths = useLocal ? local : cdn;
   }
 
-  async function device() {
-    try { if (root.navigator?.gpu && (await root.navigator.gpu.requestAdapter())) return 'webgpu'; } catch {}
-    return 'wasm';
+  async function hasGpu() {
+    try { return !!(root.navigator?.gpu && (await root.navigator.gpu.requestAdapter())); } catch { return false; }
   }
 
-  const status = () => root.AiCache.status();
+  const status = (mode) => root.AiCache.status(mode);
   const sizeMB = () => root.AiCache.sizeMB();
 
-  function prepare(onProgress = () => {}) {
-    if (models) { onProgress(1); return Promise.resolve(); }
-    if (loading) return loading;
+  // 別のモードのモデルを読み込んでいたら解放する(メモリを空ける)
+  async function release() {
+    if (!models) return;
+    const m = models;
+    models = null;
+    for (const k of ['vision', 'seg']) { try { await m[k]?.dispose?.(); } catch {} }
+  }
+
+  function prepare(mode = 'high', onProgress = () => {}) {
+    if (models && models.mode === mode) { onProgress(1); return Promise.resolve(); }
+    if (loading) return loading.then(() => prepare(mode, onProgress));
+    const expected = root.AiPolicy.downloadMB(mode) * 1e6;
     const files = {};
     let last = 0;
     const report = (p) => {
@@ -45,26 +54,30 @@
       files[p.file + p.name] = { loaded: p.loaded, total: p.total };
       const vals = Object.values(files);
       const loaded = vals.reduce((s, f) => s + f.loaded, 0);
-      const total = Math.max(EXPECTED_BYTES, vals.reduce((s, f) => s + f.total, 0));
+      const total = Math.max(expected, vals.reduce((s, f) => s + f.total, 0));
       const ratio = Math.min(0.99, loaded / total);
       if (ratio > last) { last = ratio; onProgress(ratio); }
     };
     loading = (async () => {
+      await release();
       await configure();
-      const dev = await device();
+      const dev = root.AiPolicy.devices(mode, await hasGpu());
       const tf = T();
-      const opts = (dtype) => ({ dtype, device: dev, progress_callback: report });
       const visionProc = await tf.AutoProcessor.from_pretrained(VISION);
-      const vision = await tf.SiglipVisionModel.from_pretrained(VISION, opts('q4'));
-      const segProc = await tf.AutoProcessor.from_pretrained(SEG, {
-        config: {
-          do_normalize: true, do_pad: false, do_rescale: true, do_resize: true, image_mean: [0.5, 0.5, 0.5],
-          feature_extractor_type: 'ImageFeatureExtractor', image_std: [1, 1, 1], resample: 2,
-          rescale_factor: 0.00392156862745098, size: { width: 1024, height: 1024 },
-        },
-      });
-      const seg = await tf.AutoModel.from_pretrained(SEG, { ...opts('q8'), config: { model_type: 'custom' } });
-      models = { visionProc, vision, segProc, seg, device: dev };
+      const vision = await tf.SiglipVisionModel.from_pretrained(VISION, { dtype: 'q4', device: dev.vision, progress_callback: report });
+      let segProc = null;
+      if (mode === 'high') {
+        segProc = await tf.AutoProcessor.from_pretrained(SEG.high, {
+          config: {
+            do_normalize: true, do_pad: false, do_rescale: true, do_resize: true, image_mean: [0.5, 0.5, 0.5],
+            feature_extractor_type: 'ImageFeatureExtractor', image_std: [1, 1, 1], resample: 2,
+            rescale_factor: 0.00392156862745098, size: { width: 1024, height: 1024 },
+          },
+        });
+      }
+      const seg = await tf.AutoModel.from_pretrained(SEG[mode], { dtype: mode === 'high' ? 'q8' : 'fp32', device: dev.seg, progress_callback: report, config: { model_type: 'custom' } });
+      models = { mode, visionProc, vision, segProc, seg, device: dev };
+      await root.AiCache.prune(mode).catch(() => {});
       onProgress(1);
     })();
     loading.catch(() => {}).finally(() => { loading = null; });
@@ -72,7 +85,7 @@
   }
 
   async function remove() {
-    models = null;
+    await release();
     await root.AiCache.clear();
   }
 
@@ -102,10 +115,40 @@
     return Float32Array.from(v, (x) => x / n);
   }
 
+  // 軽量モデルの前処理: 320×320 に縮め、ImageNet の平均・標準偏差でそろえる
+  function lightInput(c) {
+    const s = canvas(LIGHT_SIZE, LIGHT_SIZE);
+    const x = s.getContext('2d', { willReadFrequently: true });
+    x.drawImage(c, 0, 0, LIGHT_SIZE, LIGHT_SIZE);
+    const d = x.getImageData(0, 0, LIGHT_SIZE, LIGHT_SIZE).data;
+    const n = LIGHT_SIZE * LIGHT_SIZE;
+    const out = new Float32Array(3 * n);
+    for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) out[k * n + i] = (d[i * 4 + k] / 255 - IMAGENET.mean[k]) / IMAGENET.std[k];
+    return new (T().Tensor)('float32', out, [1, 3, LIGHT_SIZE, LIGHT_SIZE]);
+  }
+
+  // 切り抜きの形(0〜1)を返す
+  async function segment(up) {
+    if (models.mode === 'high') {
+      const { pixel_values } = await models.segProc(toRaw(up));
+      const { output } = await models.seg({ input: pixel_values });
+      return { data: output.data, dims: output.dims, min: 0, max: 1 };
+    }
+    const name = models.seg.sessions?.model?.inputNames?.[0] || 'input.1';
+    const res = await models.seg({ [name]: lightInput(up) });
+    const out = Object.values(res)[0]; // 最初の出力が、全体をまとめた結果
+    let min = Infinity, max = -Infinity;
+    const data = out.data;
+    const n = out.dims[out.dims.length - 1] * out.dims[out.dims.length - 2];
+    for (let i = 0; i < n; i++) { if (data[i] < min) min = data[i]; if (data[i] > max) max = data[i]; }
+    return { data, dims: out.dims, min, max };
+  }
+
   const toBlob = (c, type) => (c.convertToBlob ? c.convertToBlob({ type }) : new Promise((r) => c.toBlob(r, type)));
 
-  async function analyze(blob, onStep = () => {}) {
-    await prepare();
+  async function analyze(blob, mode = 'high', onStep = () => {}) {
+    onStep(0, 'AIを読み込んでいます');
+    await prepare(mode);
     if (!labels) labels = root.AiMap.decodeLabels(root.AI_LABELS);
     const bm = await createImageBitmap(blob);
     const k = Math.min(1, MAX_SIDE / Math.max(bm.width, bm.height));
@@ -116,24 +159,30 @@
     const small = Math.min(1, 336 / Math.max(w, h));
     const sw = Math.round(w * small), sh = Math.round(h * small);
     const vecs = {}, scores = {};
-    for (const deg of [0, 90, 180, 270]) {
+    const look = async (deg) => {
       vecs[deg] = await embed(rotated(bm, deg, sw, sh));
       const sims = labels.groups.type.map((e) => { let s = 0; for (let i = 0; i < e.vec.length; i++) s += e.vec[i] * vecs[deg][i]; return s; });
       scores[deg] = root.AiMap.rotationScore(sims);
+    };
+    await look(0);
+    // 軽量モードで、そのままの向きではっきり服に見えるなら、残りの3方向は調べない
+    let rotate = 0;
+    if (!root.AiPolicy.skipRotation(scores[0], mode)) {
+      for (const deg of [90, 180, 270]) await look(deg);
+      rotate = root.AiMap.pickRotation(scores);
     }
-    const rotate = root.AiMap.pickRotation(scores);
 
     // 2. 切り抜き(直した向きで行い、形は元の向きに戻す)
     onStep(2, '背景を切り抜いています');
     const up = rotated(bm, rotate, w, h);
-    const { pixel_values } = await models.segProc(toRaw(up));
-    const { output } = await models.seg({ input: pixel_values });
-    const [, , mh, mw] = output.dims;
+    const out = await segment(up);
+    const mh = out.dims[out.dims.length - 2], mw = out.dims[out.dims.length - 1];
     const m = canvas(mw, mh);
     const mx = m.getContext('2d');
     const img = mx.createImageData(mw, mh);
+    const span = out.max - out.min || 1;
     for (let i = 0; i < mw * mh; i++) {
-      const v = output.data[i] >= 0.5 ? 255 : 0;
+      const v = (out.data[i] - out.min) / span >= 0.5 ? 255 : 0;
       img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v;
       img.data[i * 4 + 3] = 255;
     }
@@ -147,12 +196,12 @@
     const ranks = {};
     for (const g of ['type', 'pattern', 'material', 'style']) ranks[g] = root.AiMap.rank(vec, labels.groups[g]);
     bm.close?.();
-    return { rotate, mask, ranks, method: 'ai', device: models.device };
+    return { rotate, mask, ranks, method: 'ai', device: models.device, mode: models.mode };
   }
 
   // 向きと切り抜きは変えずに、種類などの判別だけを行う(手で修正した画像に使う)
-  async function classify(blob) {
-    await prepare();
+  async function classify(blob, mode = 'high') {
+    await prepare(mode);
     if (!labels) labels = root.AiMap.decodeLabels(root.AI_LABELS);
     const bm = await createImageBitmap(blob);
     const k = Math.min(1, 336 / Math.max(bm.width, bm.height));

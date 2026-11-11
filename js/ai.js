@@ -4,18 +4,28 @@
   let local = null;
   let seq = 0;
   const pending = new Map();
+  const SLOW_KINDS = ['analyze', 'classify']; // 時間の上限を付ける処理
+
+  // 計算部分が落ちたとき・止めたとき: 待っている処理をすべて失敗にして、次は作り直す
+  function dropWorker(message, code) {
+    const w = worker;
+    worker = null;
+    try { w?.terminate(); } catch {}
+    for (const [id, p] of pending) { pending.delete(id); clearTimeout(p.timer); p.reject(Object.assign(new Error(message), { code })); }
+  }
 
   function startWorker() {
     if (worker || local || location.protocol === 'file:' || typeof Worker === 'undefined') return worker;
     try {
-      worker = new Worker('js/ai-worker.js');
-      worker.onmessage = (e) => {
+      const w = new Worker('js/ai-worker.js');
+      w.onmessage = (e) => {
         const p = pending.get(e.data.id);
         if (!p) return;
         if (e.data.kind === 'progress') p.onProgress?.(e.data);
-        else { pending.delete(e.data.id); e.data.kind === 'done' ? p.resolve(e.data.result) : p.reject(new Error(e.data.message)); }
+        else { pending.delete(e.data.id); clearTimeout(p.timer); e.data.kind === 'done' ? p.resolve(e.data.result) : p.reject(new Error(e.data.message)); }
       };
-      worker.onerror = () => { worker = null; };
+      w.onerror = (e) => { e?.preventDefault?.(); if (worker === w) dropWorker('AIの計算が止まりました', 'crash'); };
+      worker = w;
     } catch { worker = null; }
     return worker;
   }
@@ -40,37 +50,49 @@
     return local;
   }
 
-  async function call(kind, payload, onProgress) {
+  const timeoutError = () => Object.assign(new Error(`${Math.round(api.timeoutMs / 1000)}秒以内に終わらなかったため、処理を止めました(時間の上限)`), { code: 'timeout' });
+
+  async function call(kind, payload = {}, onProgress) {
+    payload = { ...payload, mode: api.mode };
     if (startWorker()) {
       return new Promise((resolve, reject) => {
         const id = ++seq;
-        pending.set(id, { resolve, reject, onProgress });
+        const p = { resolve, reject, onProgress, timer: null };
+        // 上限を超えたら計算部分ごと止める(止めないと裏で動き続けてメモリを使う)
+        if (SLOW_KINDS.includes(kind)) p.timer = setTimeout(() => { if (pending.has(id)) dropWorker(timeoutError().message, 'timeout'); }, api.timeoutMs);
+        pending.set(id, p);
         worker.postMessage({ id, kind, payload });
       });
     }
     const core = await useLocal();
-    if (kind === 'prepare') return core.prepare((ratio) => onProgress?.({ ratio }));
-    if (kind === 'analyze') return core.analyze(payload.blob, (step, label) => onProgress?.({ step, label }));
-    if (kind === 'classify') return core.classify(payload.blob);
-    if (kind === 'remove') return core.remove();
-    if (kind === 'status') return core.status();
-    if (kind === 'size') return core.sizeMB();
-    throw new Error(kind);
+    const run = () => {
+      if (kind === 'prepare') return core.prepare(payload.mode, (ratio) => onProgress?.({ ratio }));
+      if (kind === 'analyze') return core.analyze(payload.blob, payload.mode, (step, label) => onProgress?.({ step, label }));
+      if (kind === 'classify') return core.classify(payload.blob, payload.mode);
+      if (kind === 'remove') return core.remove();
+      if (kind === 'size') return core.sizeMB();
+      throw new Error(kind);
+    };
+    if (!SLOW_KINDS.includes(kind)) return run();
+    // 画面側で動かすときは止められないが、待つのはやめて次に進む
+    let timer;
+    return Promise.race([run(), new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutError()), api.timeoutMs); })]).finally(() => clearTimeout(timer));
   }
 
-  // 状態の確認は、AIの部品を読み込まずに保存先だけを見る
-  const status = () => root.AiCache.status().catch(() => 'unsupported');
-
-  root.Ai = {
-    status,
-    prepare: (onProgress = () => {}) => call('prepare', null, (p) => onProgress(p.ratio)),
+  const api = {
+    mode: 'high', // 'light' または 'high'。アプリが端末に合わせて決める
+    timeoutMs: 60000,
+    // 状態の確認は、AIの部品を読み込まずに保存先だけを見る
+    status: () => root.AiCache.status(api.mode).catch(() => 'unsupported'),
+    prepare: (onProgress = () => {}) => call('prepare', {}, (p) => onProgress(p.ratio)),
     analyze: (blob, onStep = () => {}) => call('analyze', { blob }, (p) => onStep(p.step, p.label)),
     classify: (blob) => call('classify', { blob }),
     remove: async () => {
       await call('remove');
-      if (worker) { worker.terminate(); worker = null; }
+      if (worker) dropWorker('AIを削除しました', 'removed');
     },
     sizeMB: () => call('size'),
     usesWorker: () => !!startWorker(),
   };
+  root.Ai = api;
 })(window);
